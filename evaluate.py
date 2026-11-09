@@ -128,6 +128,22 @@ def evaluate(weights_path: str = None, hrnet_type: str = 'w32', device_str: str 
         writer.writerow(["MEAN", f"{mean_psnr:.2f}", f"{mean_ssim:.4f}", f"{mean_sam_deg:.2f}", f"{mean_sam_rad:.4f}"])
     print(f"\n[+] Detailed per-scene test results saved to: {csv_path}")
 
+    # Update README.md benchmark table
+    readme_path = os.path.join(BASE_DIR, "README.md")
+    if os.path.exists(readme_path):
+        try:
+            with open(readme_path, "r", encoding="utf-8") as f:
+                readme_content = f.read()
+            placeholder = "| **Xie_Rep_2 (This Repo)** | *Training in Progress* | *Training in Progress* | *Training in Progress* | **118.2 MB** |"
+            rep_row = f"| **Xie_Rep_2 (This Repo)** | **{mean_psnr:.2f}** | **{mean_ssim:.4f}** | **{mean_sam_deg:.2f}°** | **118.2 MB** |"
+            if placeholder in readme_content:
+                readme_content = readme_content.replace(placeholder, rep_row)
+                with open(readme_path, "w", encoding="utf-8") as f:
+                    f.write(readme_content)
+                print(f"[+] Updated benchmark results in {readme_path}")
+        except Exception as e:
+            print(f"[!] Warning: Could not update README.md: {e}")
+
     return {
         'mean_psnr': mean_psnr,
         'mean_ssim': mean_ssim,

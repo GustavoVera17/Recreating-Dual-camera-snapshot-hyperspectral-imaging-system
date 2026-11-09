@@ -20,8 +20,13 @@ Write-Host "[+] Audit passed with 100/100 points! Starting training session..." 
 # Step 2: Initial Git Commit & Push of Initial Codebase
 Write-Host "[-] Syncing verified codebase to GitHub..." -ForegroundColor Cyan
 git add .
-git commit -m "feat: initial commit of certified 100/100 Xie_Rep_2 codebase and documentation"
-git push -u origin main
+$status = git status --porcelain
+if ($status) {
+    git commit -m "feat: initial commit of certified 100/100 Xie_Rep_2 codebase and documentation"
+    git push -u origin main
+} else {
+    Write-Host "[+] Codebase already committed and synced." -ForegroundColor Green
+}
 
 # Step 3: Launch Training with AMP, ETA and Dashboards
 $epochs = 1200
@@ -45,8 +50,13 @@ Write-Host "[*] Running final quantitative benchmark evaluation on 10 CAVE test 
 # Step 5: Final Git Push
 Write-Host "[-] Committing and pushing final results to GitHub..." -ForegroundColor Cyan
 git add results/ README.md
-git commit -m "Results: Completed 1200 epochs training and 10-scene benchmark evaluation"
-git push origin main
+$finalStatus = git status --porcelain
+if ($finalStatus) {
+    git commit -m "Results: Completed 1200 epochs training and 10-scene benchmark evaluation"
+    git push origin main
+} else {
+    Write-Host "[+] All results already committed and synced." -ForegroundColor Green
+}
 
 Write-Host "======================================================================" -ForegroundColor Green
 Write-Host "   Replication Pipeline Finished and Synced to GitHub Successfully!   " -ForegroundColor Green
