@@ -89,7 +89,7 @@ def evaluate(weights_path: str = None, hrnet_type: str = 'w32', device_str: str 
             psnr_v = float(metrics['psnr'])
             ssim_v = float(metrics['ssim'])
             sam_rad = float(metrics['sam_rad'])
-            sam_deg = float(metrics['sam_deg'])
+            sam_deg = float(metrics.get('sam_deg', sam_rad * 180.0 / np.pi))
 
             psnr_list.append(psnr_v)
             ssim_list.append(ssim_v)

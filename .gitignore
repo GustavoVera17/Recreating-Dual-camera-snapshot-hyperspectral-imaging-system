@@ -8,8 +8,8 @@ env/
 venv/
 
 # Large checkpoints exceeding GitHub 100MB limit
-results/checkpoints/latest_checkpoint.pth
-results/checkpoints/best_model.pth
+*.pth
+results/checkpoints/
 *.pth.tar
 *.ckpt
 

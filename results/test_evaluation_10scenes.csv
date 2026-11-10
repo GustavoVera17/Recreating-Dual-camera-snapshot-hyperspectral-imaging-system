@@ -1,0 +1,12 @@
+scene_name,psnr_db,ssim,sam_deg,sam_rad
+balloons_ms,16.22,0.3693,53.59,0.9353
+beads_ms,15.38,0.2538,57.76,1.0082
+cd_ms,18.87,0.3317,65.99,1.1517
+chart_and_stuffed_toy_ms,14.20,0.3919,57.69,1.0068
+clay_ms,19.14,0.5296,53.03,0.9256
+cloth_ms,18.04,0.2487,42.67,0.7447
+egyptian_statue_ms,23.20,0.6791,31.76,0.5544
+face_ms,20.03,0.4651,55.97,0.9769
+fake_and_real_beers_ms,12.69,0.3603,41.55,0.7251
+fake_and_real_food_ms,20.58,0.4152,62.35,1.0882
+MEAN,17.83,0.4045,52.24,0.9117

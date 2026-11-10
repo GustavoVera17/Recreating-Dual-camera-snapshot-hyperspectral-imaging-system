@@ -222,6 +222,7 @@ def evaluate_cube(
         'psnr': psnr,
         'ssim': ssim,
         'sam_rad': sam_rad,
+        'sam_deg': float(sam_rad * 180.0 / np.pi),
         'sam': sam_rad,
     }
 

@@ -79,7 +79,7 @@ $$\mathcal{L}_{\text{total}} = \frac{1}{n}\sum_{i=1}^n \left\| \hat{\mathbf{Y}}_
 | HSCNN+ (CVPRW '18) | 33.10 | 0.905 | 11.82° | Supervised (GT required) | ~340 MB |
 | $\lambda$-Net (SIGGRAPH '19) | 31.13 | 0.892 | 17.55° | Supervised (GT required) | ~250 MB |
 | **Xie et al. (Paper Reported)** | **39.15** | **0.943** | **11.10°** | **Self-Supervised (No GT)** | **118.2 MB** |
-| **Xie_Rep_2 (This Repo)** | *Training in Progress* | *Training in Progress* | *Training in Progress* | **118.2 MB** |
+| **Xie_Rep_2 (This Repo)** | **17.83** | **0.4045** | **52.24°** | **118.2 MB** |
 
 ### Strategy (i): Untrained Single-Scene DIP Optimization (Table 1)
 
