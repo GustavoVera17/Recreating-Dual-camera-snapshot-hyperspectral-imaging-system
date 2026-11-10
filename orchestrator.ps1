@@ -61,3 +61,7 @@ if ($finalStatus) {
 Write-Host "======================================================================" -ForegroundColor Green
 Write-Host "   Replication Pipeline Finished and Synced to GitHub Successfully!   " -ForegroundColor Green
 Write-Host "======================================================================" -ForegroundColor Green
+
+# Step 6: Shutdown Computer (Requested by User)
+Write-Host "[*] All tasks finished. Initiating computer shutdown in 120 seconds..." -ForegroundColor Yellow
+shutdown.exe /s /t 120 /c "Xie_Rep_2 training, benchmark evaluation, and GitHub upload finished successfully. Shutting down system."
