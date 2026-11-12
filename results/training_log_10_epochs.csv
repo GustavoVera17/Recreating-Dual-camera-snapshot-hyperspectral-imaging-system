@@ -1,2 +1,3 @@
 Epoch,Train_Loss,Val_PSNR_dB,Val_SSIM,Val_SAM_rad,Learning_Rate,Epoch_Time_s,Estimated_Time_Remaining
 1,2.067111,18.91,0.4407,0.5701,0.001000,80.29,00:00:12:03
+2,0.649161,19.24,0.4388,0.5875,0.001000,112.48,00:00:12:51
