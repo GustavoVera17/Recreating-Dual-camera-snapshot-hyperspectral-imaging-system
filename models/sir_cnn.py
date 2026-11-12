@@ -32,6 +32,48 @@ import torch.nn.functional as F
 from .hrnet_backbone import HRNetBackbone, HRNET_CONFIGS, BasicBlock, HRModule, HRStage
 
 
+class _NonNegativeSTE(torch.autograd.Function):
+    """
+    Non-negative activation with tangent-cone Straight-Through Estimator (STE) gradient.
+    Forward pass is strictly equivalent to ReLU(x) = max(x, 0.0).
+    Backward pass passes gradients in full when x > 0 or when grad_output < 0
+    (pulling a negative pre-activation back into the active region > 0).
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(x)
+        return F.relu(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        (x,) = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        grad_input[(x <= 0.0) & (grad_output > 0.0)] = 0.0
+        return grad_input
+
+
+class _PhysicalSpectralClampSTE(torch.autograd.Function):
+    """
+    Physical reflectance bounding in [0.0, 1.0] with tangent-cone STE gradients.
+    Forward pass is strictly equivalent to torch.clamp(x, min=0.0, max=1.0).
+    Backward pass prevents bands from permanently dying at 0.0 or 1.0 by allowing
+    recovery gradients that pull out-of-bounds predictions back into [0.0, 1.0]
+    while blocking gradients that push predictions further outside [0.0, 1.0].
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(x)
+        return torch.clamp(x, min=0.0, max=1.0)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        (x,) = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        grad_input[(x < 0.0) & (grad_output > 0.0)] = 0.0
+        grad_input[(x > 1.0) & (grad_output < 0.0)] = 0.0
+        return grad_input
+
+
 class Stage1DimensionalAscending(nn.Module):
     """
     Stage 1: Dimensional Ascension & Dispersion Contraction Layer.
@@ -50,9 +92,25 @@ class Stage1DimensionalAscending(nn.Module):
             bias=True
         )
         self.relu = nn.ReLU(inplace=True)
+        self._init_physical_unshift()
+
+    def _init_physical_unshift(self) -> None:
+        """
+        Initializes the (1, lambda) filter bank as a physical dispersion unshifting
+        operator so that channel k extracts horizontal offset k (corresponding to
+        wavelength band k in the dispersed CASSI measurement) scaled by 2 / lambda.
+        """
+        with torch.no_grad():
+            nn.init.normal_(self.conv1x_lambda.weight, mean=0.0, std=1e-3)
+            out_ch, in_ch, _, k_w = self.conv1x_lambda.weight.shape
+            scale = 2.0 / float(max(1, out_ch))
+            for k in range(min(out_ch, k_w)):
+                self.conv1x_lambda.weight[k, 0, 0, k] = scale
+            if self.conv1x_lambda.bias is not None:
+                self.conv1x_lambda.bias.fill_(1e-2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.relu(self.conv1x_lambda(x))
+        return _NonNegativeSTE.apply(self.conv1x_lambda(x))
 
     def __getitem__(self, idx: int) -> nn.Module:
         if idx == 0:
@@ -122,6 +180,8 @@ class SpectralImageReconstructionCNN(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(total_channels, self.num_bands, kernel_size=3, padding=1, bias=True)
         )
+        # Learnable residual scaling preserving Stage 1 radiometric anchor across BatchNorm
+        self.res_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
     @property
     def use_checkpoint(self) -> bool:
@@ -163,11 +223,12 @@ class SpectralImageReconstructionCNN(nn.Module):
         # Multiscale aggregation: upsample all streams to H x W and concatenate
         fused = self.backbone.aggregate(streams)
 
-        # Reconstruction head projection
-        raw_pred = self.head(fused)
+        # Reconstruction head projection + Stage 1 radiometric residual anchor
+        raw_head = self.head(fused)
+        raw_pred = x_stage1 + self.res_scale * raw_head
 
-        # Hard physical spectral bounding
-        out = torch.clamp(raw_pred, min=0.0, max=1.0)
+        # Physical spectral bounding in [0.0, 1.0] with tangent-cone recovery gradients
+        out = _PhysicalSpectralClampSTE.apply(raw_pred)
 
         return out if is_batched else out.squeeze(0)
 

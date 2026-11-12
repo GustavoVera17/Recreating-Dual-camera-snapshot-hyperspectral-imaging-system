@@ -299,7 +299,9 @@ class CAVEDualDataset(Dataset):
             left = int(np.random.randint(0, max_w + 1))
 
             patch_cube = full_cube[top : top + ps, left : left + ps, :].copy()
-            patch_mask = self.mask_plate[top : top + ps, left : left + ps].copy()
+            # Physical hardware consistency: the coded aperture plate is stationary in the
+            # optical path, so every ps x ps scene patch is modulated by the same fixed mask.
+            patch_mask = self.mask_plate[:ps, :ps].copy()
 
             # Dynamic Spatial Data Augmentations
             if self.augment:
@@ -325,7 +327,7 @@ class CAVEDualDataset(Dataset):
                 top = max_h // 2
                 left = max_w // 2
                 patch_cube = full_cube[top : top + ps, left : left + ps, :].copy()
-                patch_mask = self.mask_plate[top : top + ps, left : left + ps].copy()
+                patch_mask = self.mask_plate[:ps, :ps].copy()
 
         # Convert to PyTorch Tensors [C, H, W]
         tensor_cube = torch.from_numpy(patch_cube).permute(2, 0, 1).to(dtype=self.dtype)

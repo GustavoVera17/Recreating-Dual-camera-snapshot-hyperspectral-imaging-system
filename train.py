@@ -166,6 +166,26 @@ def parse_args():
         choices=['auto', 'cuda', 'cpu'],
         help="Compute device selection"
     )
+    parser.add_argument(
+        '--beta-spec', '--beta_spec',
+        type=float,
+        default=0.5,
+        dest='beta_spec',
+        help="Self-supervised spectral continuity regularization weight"
+    )
+    parser.add_argument(
+        '--beta-tv', '--beta_tv',
+        type=float,
+        default=0.05,
+        dest='beta_tv',
+        help="Self-supervised spatial total variation regularization weight"
+    )
+    parser.add_argument(
+        '--git-sync', '--git_sync',
+        action='store_true',
+        dest='git_sync',
+        help="Enable periodic git commit/push every 50 epochs"
+    )
 
     return parser.parse_args()
 
@@ -400,7 +420,11 @@ def main():
     ).to(device)
 
     forward_model = DualCameraForwardModel().to(device)
-    criterion = PhysicsLoss(forward_model=forward_model).to(device)
+    criterion = PhysicsLoss(
+        forward_model=forward_model,
+        beta_spec=args.beta_spec,
+        beta_tv=args.beta_tv,
+    ).to(device)
 
     # 6. Optimizer, Scheduler & Mixed Precision Scaler
     optimizer = torch.optim.Adam(
@@ -472,6 +496,8 @@ def main():
                     loss_res = criterion(pred_cube, meas_cassi, meas_rgb, mask=mask)
                     loss_total = loss_res.loss_total
                 scaler.scale(loss_total).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -479,6 +505,7 @@ def main():
                 loss_res = criterion(pred_cube, meas_cassi, meas_rgb, mask=mask)
                 loss_total = loss_res.loss_total
                 loss_total.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
             total_loss += loss_total.item()
@@ -488,24 +515,35 @@ def main():
         avg_train_loss = total_loss / max(1, num_batches)
         current_lr = float(optimizer.param_groups[0]['lr'])
 
-        # Validation evaluation
+        # Validation evaluation across all validation scenes
         model.eval()
+        val_psnr_list, val_ssim_list, val_sam_list = [], [], []
         val_sample = val_dataset[0]
         val_cassi = val_sample['meas_cassi'].unsqueeze(0).to(device)
         val_gt = val_sample['cube']
+        val_pred_cube = None
 
         with torch.no_grad():
-            if device.type == 'cuda' and scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    val_pred = model(val_cassi)
-            else:
-                val_pred = model(val_cassi)
+            for v_idx in range(len(val_dataset)):
+                v_item = val_dataset[v_idx]
+                v_cassi = v_item['meas_cassi'].unsqueeze(0).to(device)
+                v_gt = v_item['cube']
+                if device.type == 'cuda' and scaler is not None:
+                    with torch.amp.autocast('cuda'):
+                        v_pred = model(v_cassi)
+                else:
+                    v_pred = model(v_cassi)
+                v_pred_cpu = v_pred[0].float().cpu()
+                if v_idx == 0:
+                    val_pred_cube = v_pred_cpu
+                v_metrics = evaluate_cube(v_pred_cpu, v_gt)
+                val_psnr_list.append(float(v_metrics['psnr']))
+                val_ssim_list.append(float(v_metrics['ssim']))
+                val_sam_list.append(float(v_metrics['sam_rad']))
 
-        val_pred_cube = val_pred[0].cpu()
-        val_metrics = evaluate_cube(val_pred_cube, val_gt)
-        val_psnr = float(val_metrics['psnr'])
-        val_ssim = float(val_metrics['ssim'])
-        val_sam = float(val_metrics['sam_rad'])
+        val_psnr = float(np.mean(val_psnr_list))
+        val_ssim = float(np.mean(val_ssim_list))
+        val_sam = float(np.mean(val_sam_list))
 
         epoch_dur = time.time() - t_epoch_start
 
@@ -567,8 +605,8 @@ def main():
                 band_idx=15,
             )
 
-        # Periodic Git Push to GitHub every 50 epochs or at the end
-        if epoch % 50 == 0 or epoch == args.epochs:
+        # Periodic Git Push to GitHub every 50 epochs or at the end (when --git-sync is enabled)
+        if args.git_sync and (epoch % 50 == 0 or epoch == args.epochs):
             try:
                 import subprocess
                 subprocess.run(["git", "add", "results/", "README.md"], cwd=BASE_DIR, check=False)

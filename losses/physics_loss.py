@@ -102,7 +102,9 @@ class PhysicsLoss(nn.Module):
     def __init__(
         self,
         forward_model: Optional[DualCameraForwardModel] = None,
-        alpha: float = 1.0
+        alpha: float = 1.0,
+        beta_spec: float = 0.0,
+        beta_tv: float = 0.0
     ):
         super().__init__()
         if forward_model is not None:
@@ -110,6 +112,8 @@ class PhysicsLoss(nn.Module):
         else:
             self.forward_model = DualCameraForwardModel()
         self.alpha = float(alpha)
+        self.beta_spec = float(beta_spec)
+        self.beta_tv = float(beta_tv)
         self.mse = nn.MSELoss()
 
     def forward(
@@ -140,6 +144,17 @@ class PhysicsLoss(nn.Module):
 
         # Joint total loss
         loss_total = loss_cassi + self.alpha * loss_rgb
+
+        # Optional self-supervised spectral continuity & spatial TV priors
+        # to regularize the 28-dimensional CRF null space and occluded mask pixels
+        if self.beta_spec > 0.0 and pred_cube.shape[-3] > 1:
+            spec_diff = pred_cube[..., 1:, :, :] - pred_cube[..., :-1, :, :]
+            loss_total = loss_total + self.beta_spec * torch.mean(spec_diff * spec_diff)
+
+        if self.beta_tv > 0.0 and pred_cube.shape[-2] > 1 and pred_cube.shape[-1] > 1:
+            tv_h = pred_cube[..., :, 1:, :] - pred_cube[..., :, :-1, :]
+            tv_w = pred_cube[..., :, :, 1:] - pred_cube[..., :, :, :-1]
+            loss_total = loss_total + self.beta_tv * (torch.mean(tv_h * tv_h) + torch.mean(tv_w * tv_w))
 
         result = LossResult(loss_total, loss_cassi, loss_rgb)
         if return_dict:
