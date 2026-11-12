@@ -181,13 +181,83 @@ def parse_args():
         help="Self-supervised spatial total variation regularization weight"
     )
     parser.add_argument(
+        '--log-filename', '--log_filename',
+        type=str,
+        default='training_log.csv',
+        dest='log_filename',
+        help="CSV log filename inside results_dir"
+    )
+    parser.add_argument(
+        '--dashboards-dir', '--dashboards_dir',
+        type=str,
+        default=None,
+        dest='dashboards_dir',
+        help="Optional override directory for visual dashboards"
+    )
+    parser.add_argument(
         '--git-sync', '--git_sync',
         action='store_true',
         dest='git_sync',
-        help="Enable periodic git commit/push every 50 epochs"
+        help="Enable periodic git commit/push during training"
+    )
+    parser.add_argument(
+        '--git-sync-interval', '--git_sync_interval',
+        type=int,
+        default=50,
+        dest='git_sync_interval',
+        help="Epoch interval for periodic git commit/push when --git-sync is enabled"
     )
 
     return parser.parse_args()
+
+
+def _resolve_amp_config(device: torch.device) -> Tuple[Optional[torch.dtype], Optional[torch.amp.GradScaler]]:
+    """Selects BF16 autocast without GradScaler on supported GPUs, falling back to FP16+GradScaler."""
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return None, None
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16, None
+    return torch.float16, torch.amp.GradScaler('cuda')
+
+
+def _execute_train_step(
+    model: nn.Module,
+    criterion: PhysicsLoss,
+    optimizer: torch.optim.Optimizer,
+    meas_cassi: torch.Tensor,
+    meas_rgb: torch.Tensor,
+    mask: torch.Tensor,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+    scaler: Optional[torch.amp.GradScaler],
+    max_grad_norm: float = 5.0,
+):
+    """Runs one forward/backward optimization step with AMP forward and FP32 physics loss."""
+    optimizer.zero_grad()
+    amp_ctx = (
+        torch.amp.autocast('cuda', dtype=amp_dtype)
+        if (device.type == 'cuda' and amp_dtype is not None)
+        else nullcontext()
+    )
+    with amp_ctx:
+        pred_cube = model(meas_cassi)
+
+    # Keep forward physics operators (31-band summation & CRF dot product) in FP32 to avoid half-precision overflow.
+    loss_res = criterion(pred_cube.float(), meas_cassi.float(), meas_rgb.float(), mask=mask.float())
+    loss_total = loss_res.loss_total
+
+    if scaler is not None:
+        scaler.scale(loss_total).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss_total.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        optimizer.step()
+
+    return loss_res
 
 
 def run_dry_run_verification(
@@ -195,6 +265,7 @@ def run_dry_run_verification(
     forward_model: DualCameraForwardModel,
     criterion: PhysicsLoss,
     optimizer: torch.optim.Optimizer,
+    amp_dtype: Optional[torch.dtype],
     scaler: Optional[torch.amp.GradScaler],
     device: torch.device,
     train_dataset: CAVEDualDataset,
@@ -240,26 +311,21 @@ def run_dry_run_verification(
     print(f"    - mask       : {tuple(mask.shape)}")
     print(f"    - gt_cube    : {tuple(gt_cube.shape)}")
 
-    # 2. Forward pass with PyTorch AMP
+    # 2. Forward & backward pass with PyTorch AMP (BF16 preferred, FP32 physics loss)
     model.train()
-    optimizer.zero_grad()
-
     t_start = time.time()
-    if device.type == 'cuda' and scaler is not None:
-        with torch.amp.autocast('cuda'):
-            pred_cube = model(meas_cassi)
-            loss_res = criterion(pred_cube, meas_cassi, meas_rgb, mask=mask)
-            loss_total = loss_res.loss_total
-        # 3. Backward pass with GradScaler
-        scaler.scale(loss_total).backward()
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        pred_cube = model(meas_cassi)
-        loss_res = criterion(pred_cube, meas_cassi, meas_rgb, mask=mask)
-        loss_total = loss_res.loss_total
-        loss_total.backward()
-        optimizer.step()
+    loss_res = _execute_train_step(
+        model=model,
+        criterion=criterion,
+        optimizer=optimizer,
+        meas_cassi=meas_cassi,
+        meas_rgb=meas_rgb,
+        mask=mask,
+        device=device,
+        amp_dtype=amp_dtype,
+        scaler=scaler,
+    )
+    loss_total = loss_res.loss_total
 
     forward_backward_time = time.time() - t_start
 
@@ -271,11 +337,12 @@ def run_dry_run_verification(
     if len(active_grads) == 0:
         raise RuntimeError("Dry-run failed: No gradients accumulated on model parameters!")
 
-    has_nan = any(torch.isnan(g).any().item() for g in active_grads)
+    has_nan = any(torch.isnan(g).any().item() or torch.isinf(g).any().item() for g in active_grads)
     if has_nan:
-        raise RuntimeError("Dry-run failed: NaN detected in accumulated gradients!")
+        raise RuntimeError("Dry-run failed: NaN or Inf detected in accumulated gradients!")
 
     print(f"[+] Mini-batch forward & backward pass completed in {forward_backward_time:.3f}s.")
+    print(f"    - AMP dtype      : {amp_dtype if amp_dtype is not None else 'float32'}")
     print(f"    - Loss Total     : {loss_total.item():.6f}")
     print(f"    - Loss CASSI     : {loss_res.loss_cassi.item():.6f}")
     print(f"    - Loss RGB       : {loss_res.loss_rgb.item():.6f}")
@@ -287,14 +354,16 @@ def run_dry_run_verification(
     val_cassi = val_sample['meas_cassi'].unsqueeze(0).to(device)
     val_gt = val_sample['cube']  # [31, H, W]
 
+    amp_ctx = (
+        torch.amp.autocast('cuda', dtype=amp_dtype)
+        if (device.type == 'cuda' and amp_dtype is not None)
+        else nullcontext()
+    )
     with torch.no_grad():
-        if device.type == 'cuda' and scaler is not None:
-            with torch.amp.autocast('cuda'):
-                val_pred = model(val_cassi)
-        else:
+        with amp_ctx:
             val_pred = model(val_cassi)
 
-    val_pred_cube = val_pred[0].cpu()  # [31, H, W]
+    val_pred_cube = val_pred[0].float().cpu()  # [31, H, W]
     metrics = evaluate_cube(val_pred_cube, val_gt)
 
     val_psnr = float(metrics['psnr'])
@@ -368,14 +437,18 @@ def main():
     else:
         results_dir = os.path.join(BASE_DIR, "results")
 
-    dashboards_dir = os.path.join(results_dir, "dashboards")
+    dashboards_dir = (
+        os.path.abspath(args.dashboards_dir)
+        if args.dashboards_dir is not None
+        else os.path.join(results_dir, "dashboards")
+    )
     checkpoints_dir = os.path.join(results_dir, "checkpoints")
     os.makedirs(results_dir, exist_ok=True)
     os.makedirs(dashboards_dir, exist_ok=True)
     os.makedirs(checkpoints_dir, exist_ok=True)
 
     # 3. CSV Logger and Visual Dashboard Generator Initialization
-    csv_path = os.path.join(results_dir, "training_log.csv")
+    csv_path = os.path.join(results_dir, args.log_filename)
     logger = CSVLogger(log_path=csv_path)
     dashboard_gen = VisualDashboardGenerator(output_dir=dashboards_dir)
 
@@ -440,7 +513,9 @@ def main():
         gamma=args.decay_gamma,
     )
 
-    scaler = torch.amp.GradScaler('cuda') if (device.type == 'cuda' and torch.cuda.is_available()) else None
+    amp_dtype, scaler = _resolve_amp_config(device)
+    amp_label = str(amp_dtype).replace('torch.', '') if amp_dtype is not None else 'float32'
+    print(f"[*] Precision mode   : {amp_label} forward (FP32 physics loss, scaler={'on' if scaler is not None else 'off'})")
 
     # 7. REQUIREMENT R4 CHECK: If dry-run, execute verification and exit immediately
     if args.dry_run:
@@ -449,6 +524,7 @@ def main():
             forward_model=forward_model,
             criterion=criterion,
             optimizer=optimizer,
+            amp_dtype=amp_dtype,
             scaler=scaler,
             device=device,
             train_dataset=train_dataset,
@@ -488,27 +564,20 @@ def main():
             meas_rgb = batch['meas_rgb'].to(device)
             mask = batch['mask'].to(device)
 
-            optimizer.zero_grad()
+            loss_res = _execute_train_step(
+                model=model,
+                criterion=criterion,
+                optimizer=optimizer,
+                meas_cassi=meas_cassi,
+                meas_rgb=meas_rgb,
+                mask=mask,
+                device=device,
+                amp_dtype=amp_dtype,
+                scaler=scaler,
+                max_grad_norm=5.0,
+            )
 
-            if device.type == 'cuda' and scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    pred_cube = model(meas_cassi)
-                    loss_res = criterion(pred_cube, meas_cassi, meas_rgb, mask=mask)
-                    loss_total = loss_res.loss_total
-                scaler.scale(loss_total).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                pred_cube = model(meas_cassi)
-                loss_res = criterion(pred_cube, meas_cassi, meas_rgb, mask=mask)
-                loss_total = loss_res.loss_total
-                loss_total.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                optimizer.step()
-
-            total_loss += loss_total.item()
+            total_loss += loss_res.loss_total.item()
             num_batches += 1
 
         scheduler.step()
@@ -523,15 +592,17 @@ def main():
         val_gt = val_sample['cube']
         val_pred_cube = None
 
+        amp_ctx = (
+            torch.amp.autocast('cuda', dtype=amp_dtype)
+            if (device.type == 'cuda' and amp_dtype is not None)
+            else nullcontext()
+        )
         with torch.no_grad():
             for v_idx in range(len(val_dataset)):
                 v_item = val_dataset[v_idx]
                 v_cassi = v_item['meas_cassi'].unsqueeze(0).to(device)
                 v_gt = v_item['cube']
-                if device.type == 'cuda' and scaler is not None:
-                    with torch.amp.autocast('cuda'):
-                        v_pred = model(v_cassi)
-                else:
+                with amp_ctx:
                     v_pred = model(v_cassi)
                 v_pred_cpu = v_pred[0].float().cpu()
                 if v_idx == 0:
@@ -605,16 +676,37 @@ def main():
                 band_idx=15,
             )
 
-        # Periodic Git Push to GitHub every 50 epochs or at the end (when --git-sync is enabled)
-        if args.git_sync and (epoch % 50 == 0 or epoch == args.epochs):
+        # Periodic Git Push to GitHub when --git-sync is enabled
+        sync_interval = max(1, int(args.git_sync_interval))
+        if args.git_sync and (epoch % sync_interval == 0 or epoch == args.epochs):
             try:
                 import subprocess
-                subprocess.run(["git", "add", "results/", "README.md"], cwd=BASE_DIR, check=False)
-                subprocess.run(["git", "commit", "-m", f"Auto-sync: Training metrics and dashboard at epoch {epoch}"], cwd=BASE_DIR, check=False)
-                subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR, check=False)
-                print(f"  [-] Synced epoch {epoch} results to GitHub successfully.")
+                targets = []
+                for p in (csv_path, dashboards_dir, os.path.join(BASE_DIR, "README.md")):
+                    if os.path.exists(p):
+                        targets.append(os.path.relpath(p, BASE_DIR))
+                if not targets:
+                    targets = ["results/", "README.md"]
+                subprocess.run(["git", "add", "--", *targets], cwd=BASE_DIR, check=True)
+                status_res = subprocess.run(
+                    ["git", "status", "--porcelain", "--", *targets],
+                    cwd=BASE_DIR,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                if status_res.stdout.strip():
+                    subprocess.run(
+                        ["git", "commit", "-m", f"Auto-sync: Training metrics at epoch {epoch}"],
+                        cwd=BASE_DIR,
+                        check=True,
+                    )
+                    subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR, check=True)
+                    print(f"  [-] Synced epoch {epoch} results to GitHub successfully.")
+                else:
+                    print(f"  [-] No new git changes at epoch {epoch}.")
             except Exception as e:
-                print(f"  [!] Git push notice: {e}")
+                print(f"  [!] Git push notice at epoch {epoch}: {e}")
 
 
 if __name__ == '__main__':
