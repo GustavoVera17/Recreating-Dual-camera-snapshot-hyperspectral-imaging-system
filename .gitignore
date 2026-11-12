@@ -10,6 +10,8 @@ venv/
 # Large checkpoints exceeding GitHub 100MB limit
 *.pth
 results/checkpoints/
+!results/weights/
+!results/weights/*.pth
 *.pth.tar
 *.ckpt
 

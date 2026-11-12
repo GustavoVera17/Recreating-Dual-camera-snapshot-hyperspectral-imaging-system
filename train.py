@@ -205,10 +205,35 @@ def parse_args():
         type=int,
         default=50,
         dest='git_sync_interval',
-        help="Epoch interval for periodic git commit/push when --git-sync is enabled"
+        help="Epoch interval for periodic git commit/push of logs & dashboards"
+    )
+    parser.add_argument(
+        '--weights-sync-interval', '--weights_sync_interval',
+        type=int,
+        default=100,
+        dest='weights_sync_interval',
+        help="Epoch interval for periodic git commit/push of compact FP16 weights (0 disables)"
+    )
+    parser.add_argument(
+        '--fresh',
+        action='store_true',
+        help="Overwrite existing CSV log file instead of appending"
     )
 
     return parser.parse_args()
+
+
+def _dedup_fp16_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Serializes unique tensor storages in FP16 so checkpoints stay under GitHub's 100MB limit."""
+    seen_ptrs = set()
+    compact_state: Dict[str, torch.Tensor] = {}
+    for k, v in model.state_dict().items():
+        ptr = v.data_ptr()
+        if ptr in seen_ptrs:
+            continue
+        seen_ptrs.add(ptr)
+        compact_state[k] = v.detach().cpu().half() if v.is_floating_point() else v.detach().cpu()
+    return compact_state
 
 
 def _resolve_amp_config(device: torch.device) -> Tuple[Optional[torch.dtype], Optional[torch.amp.GradScaler]]:
@@ -443,13 +468,15 @@ def main():
         else os.path.join(results_dir, "dashboards")
     )
     checkpoints_dir = os.path.join(results_dir, "checkpoints")
+    weights_sync_dir = os.path.join(results_dir, "weights")
     os.makedirs(results_dir, exist_ok=True)
     os.makedirs(dashboards_dir, exist_ok=True)
     os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(weights_sync_dir, exist_ok=True)
 
     # 3. CSV Logger and Visual Dashboard Generator Initialization
     csv_path = os.path.join(results_dir, args.log_filename)
-    logger = CSVLogger(log_path=csv_path)
+    logger = CSVLogger(log_path=csv_path, overwrite=args.fresh)
     dashboard_gen = VisualDashboardGenerator(output_dir=dashboards_dir)
 
     print("=" * 78)
@@ -655,13 +682,13 @@ def main():
             best_psnr = val_psnr
             best_ckpt_path = os.path.join(checkpoints_dir, "best_model.pth")
             torch.save(model.state_dict(), best_ckpt_path)
-            # Save FP16 copy for GitHub push under 100MB limit
+            # Save deduplicated FP16 copy (~60MB < 100MB GitHub limit)
             try:
-                fp16_state = {k: v.half() for k, v in model.state_dict().items()}
-                best_fp16_path = os.path.join(checkpoints_dir, "best_model_fp16.pth")
-                torch.save(fp16_state, best_fp16_path)
+                fp16_state = _dedup_fp16_state_dict(model)
+                torch.save(fp16_state, os.path.join(checkpoints_dir, "best_model_fp16.pth"))
+                torch.save(fp16_state, os.path.join(weights_sync_dir, "best_model_fp16.pth"))
             except Exception as e:
-                pass
+                print(f"  [!] FP16 checkpoint save notice: {e}")
             print(f"  [+] New Best PSNR: {best_psnr:.2f} dB (saved {best_ckpt_path})")
 
         # Visual Dashboard Generation
@@ -678,33 +705,39 @@ def main():
 
         # Periodic Git Push to GitHub when --git-sync is enabled
         sync_interval = max(1, int(args.git_sync_interval))
-        if args.git_sync and (epoch % sync_interval == 0 or epoch == args.epochs):
+        weights_interval = int(args.weights_sync_interval)
+        due_metrics = (epoch % sync_interval == 0 or epoch == args.epochs)
+        due_weights = (weights_interval > 0 and (epoch % weights_interval == 0 or epoch == args.epochs))
+        if args.git_sync and (due_metrics or due_weights):
             try:
                 import subprocess
                 targets = []
-                for p in (csv_path, dashboards_dir, os.path.join(BASE_DIR, "README.md")):
-                    if os.path.exists(p):
-                        targets.append(os.path.relpath(p, BASE_DIR))
-                if not targets:
-                    targets = ["results/", "README.md"]
-                subprocess.run(["git", "add", "--", *targets], cwd=BASE_DIR, check=True)
-                status_res = subprocess.run(
-                    ["git", "status", "--porcelain", "--", *targets],
-                    cwd=BASE_DIR,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                if status_res.stdout.strip():
-                    subprocess.run(
-                        ["git", "commit", "-m", f"Auto-sync: Training metrics at epoch {epoch}"],
+                if due_metrics:
+                    for p in (csv_path, dashboards_dir, os.path.join(BASE_DIR, "README.md")):
+                        if os.path.exists(p):
+                            targets.append(os.path.relpath(p, BASE_DIR))
+                if due_weights and os.path.exists(weights_sync_dir):
+                    targets.append(os.path.relpath(weights_sync_dir, BASE_DIR))
+                if targets:
+                    subprocess.run(["git", "add", "--", *targets], cwd=BASE_DIR, check=True)
+                    status_res = subprocess.run(
+                        ["git", "status", "--porcelain", "--", *targets],
                         cwd=BASE_DIR,
+                        capture_output=True,
+                        text=True,
                         check=True,
                     )
-                    subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR, check=True)
-                    print(f"  [-] Synced epoch {epoch} results to GitHub successfully.")
-                else:
-                    print(f"  [-] No new git changes at epoch {epoch}.")
+                    if status_res.stdout.strip():
+                        tag = "metrics & weights" if due_weights else "metrics & dashboards"
+                        subprocess.run(
+                            ["git", "commit", "-m", f"Auto-sync: Training {tag} at epoch {epoch}"],
+                            cwd=BASE_DIR,
+                            check=True,
+                        )
+                        subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR, check=True)
+                        print(f"  [-] Synced epoch {epoch} ({tag}) to GitHub successfully.")
+                    else:
+                        print(f"  [-] No new git changes at epoch {epoch}.")
             except Exception as e:
                 print(f"  [!] Git push notice at epoch {epoch}: {e}")
 
