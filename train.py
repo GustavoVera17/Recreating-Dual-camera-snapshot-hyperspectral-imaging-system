@@ -32,6 +32,7 @@ Key Architectural Highlights:
 import os
 import sys
 import time
+import random
 import argparse
 from typing import Optional, Dict, Any, Tuple
 from contextlib import nullcontext
@@ -79,7 +80,27 @@ def parse_args():
         type=int,
         default=16,
         dest='batch_size',
-        help="Training batch size"
+        help="Effective training batch size"
+    )
+    parser.add_argument(
+        '--micro-batch-size', '--micro_batch_size',
+        type=int,
+        default=4,
+        dest='micro_batch_size',
+        help="Physical GPU micro-batch size for gradient accumulation within 12GB VRAM"
+    )
+    parser.add_argument(
+        '--num-patches-per-scene', '--num_patches_per_scene',
+        type=int,
+        default=30,
+        dest='num_patches_per_scene',
+        help="Stochastic 256x256 crops sampled per training scene per epoch"
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help="Global RNG seed for reproducibility"
     )
     parser.add_argument(
         '--patch-size', '--patch_size',
@@ -169,16 +190,16 @@ def parse_args():
     parser.add_argument(
         '--beta-spec', '--beta_spec',
         type=float,
-        default=0.5,
+        default=0.0,
         dest='beta_spec',
-        help="Self-supervised spectral continuity regularization weight"
+        help="Optional spectral continuity regularization weight (0.0 matches Xie et al. Eq. 4-5)"
     )
     parser.add_argument(
         '--beta-tv', '--beta_tv',
         type=float,
-        default=0.05,
+        default=0.0,
         dest='beta_tv',
-        help="Self-supervised spatial total variation regularization weight"
+        help="Optional spatial total variation regularization weight (0.0 matches Xie et al. Eq. 4-5)"
     )
     parser.add_argument(
         '--log-filename', '--log_filename',
@@ -221,6 +242,15 @@ def parse_args():
     )
 
     return parser.parse_args()
+
+
+def _set_global_seed(seed: int) -> None:
+    """Seeds Python, NumPy, and PyTorch RNGs for reproducible runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _dedup_fp16_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -283,6 +313,51 @@ def _execute_train_step(
         optimizer.step()
 
     return loss_res
+
+
+def _execute_accum_group(
+    model: nn.Module,
+    criterion: PhysicsLoss,
+    optimizer: torch.optim.Optimizer,
+    micro_batches: list,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+    scaler: Optional[torch.amp.GradScaler],
+    max_grad_norm: float = 5.0,
+) -> float:
+    """Accumulates gradients over micro-batches to match the effective batch size cleanly."""
+    optimizer.zero_grad()
+    amp_ctx = (
+        torch.amp.autocast('cuda', dtype=amp_dtype)
+        if (device.type == 'cuda' and amp_dtype is not None)
+        else nullcontext()
+    )
+    group_n = len(micro_batches)
+    group_loss = 0.0
+    for batch in micro_batches:
+        meas_cassi = batch['meas_cassi'].to(device, non_blocking=(device.type == 'cuda'))
+        meas_rgb = batch['meas_rgb'].to(device, non_blocking=(device.type == 'cuda'))
+        mask = batch['mask'].to(device, non_blocking=(device.type == 'cuda'))
+        with amp_ctx:
+            pred_cube = model(meas_cassi)
+        loss_res = criterion(pred_cube.float(), meas_cassi.float(), meas_rgb.float(), mask=mask.float())
+        scaled_loss = loss_res.loss_total / float(group_n)
+        if scaler is not None:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+        group_loss += float(loss_res.loss_total.item())
+
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        optimizer.step()
+
+    return group_loss / float(group_n)
 
 
 def run_dry_run_verification(
@@ -447,6 +522,7 @@ def run_dry_run_verification(
 
 def main():
     args = parse_args()
+    _set_global_seed(args.seed)
 
     # 1. Device Resolution
     if args.device == 'auto':
@@ -479,11 +555,14 @@ def main():
     logger = CSVLogger(log_path=csv_path, overwrite=args.fresh)
     dashboard_gen = VisualDashboardGenerator(output_dir=dashboards_dir)
 
+    micro_bs = min(args.batch_size, max(1, args.micro_batch_size))
+    accum_steps = max(1, (args.batch_size + micro_bs - 1) // micro_bs)
     print("=" * 78)
     print("  Xie et al. (2022) Snapshot Hyperspectral Imaging Training Harness")
     print(f"  Device           : {device} ({device_name})")
     print(f"  HRNet Backbone   : HRNet-{args.hrnet_type.upper()}")
-    print(f"  Batch / Patch    : {args.batch_size} / {args.patch_size}x{args.patch_size}")
+    print(f"  Batch / Patch    : {args.batch_size} (micro={micro_bs}, accum={accum_steps}) / {args.patch_size}x{args.patch_size}")
+    print(f"  Patches / Scene  : {args.num_patches_per_scene} (seed={args.seed}, beta_spec={args.beta_spec}, beta_tv={args.beta_tv})")
     print(f"  Learning Rate    : {args.lr} (Decay: gamma={args.decay_gamma} every {args.decay_step} epochs)")
     print(f"  Total Epochs     : {args.epochs}")
     print(f"  Results Dir      : {results_dir}")
@@ -497,6 +576,7 @@ def main():
         split='train',
         patch_size=args.patch_size,
         is_train=True,
+        num_patches_per_scene=args.num_patches_per_scene,
         mask_path=args.mask_path,
         synthetic_fallback=True,
         preload=True,
@@ -570,7 +650,7 @@ def main():
     pin_mem = (device.type == 'cuda')
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=micro_bs,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=pin_mem,
@@ -578,38 +658,55 @@ def main():
     )
 
     best_psnr = -1.0
-    print(f"\n[*] Commencing full training cycle ({args.epochs} epochs)...")
+    print(f"\n[*] Commencing full training cycle ({args.epochs} epochs, {len(train_dataset)} samples/ep)...")
 
     for epoch in range(1, args.epochs + 1):
         t_epoch_start = time.time()
+        if device.type == 'cuda' and epoch == 1:
+            torch.cuda.reset_peak_memory_stats()
         model.train()
         total_loss = 0.0
-        num_batches = 0
+        num_opt_steps = 0
+        pending_group = []
 
         for batch in train_loader:
-            meas_cassi = batch['meas_cassi'].to(device)
-            meas_rgb = batch['meas_rgb'].to(device)
-            mask = batch['mask'].to(device)
+            pending_group.append(batch)
+            if len(pending_group) >= accum_steps:
+                step_loss = _execute_accum_group(
+                    model=model,
+                    criterion=criterion,
+                    optimizer=optimizer,
+                    micro_batches=pending_group,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    scaler=scaler,
+                    max_grad_norm=5.0,
+                )
+                total_loss += step_loss
+                num_opt_steps += 1
+                pending_group.clear()
 
-            loss_res = _execute_train_step(
+        if pending_group:
+            step_loss = _execute_accum_group(
                 model=model,
                 criterion=criterion,
                 optimizer=optimizer,
-                meas_cassi=meas_cassi,
-                meas_rgb=meas_rgb,
-                mask=mask,
+                micro_batches=pending_group,
                 device=device,
                 amp_dtype=amp_dtype,
                 scaler=scaler,
                 max_grad_norm=5.0,
             )
-
-            total_loss += loss_res.loss_total.item()
-            num_batches += 1
+            total_loss += step_loss
+            num_opt_steps += 1
+            pending_group.clear()
 
         scheduler.step()
-        avg_train_loss = total_loss / max(1, num_batches)
+        avg_train_loss = total_loss / max(1, num_opt_steps)
         current_lr = float(optimizer.param_groups[0]['lr'])
+        if device.type == 'cuda' and epoch == 1:
+            peak_mib = torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+            print(f"[*] Epoch 1 Peak CUDA VRAM allocated: {peak_mib:.1f} MiB ({num_opt_steps} optimizer steps/epoch)")
 
         # Validation evaluation across all validation scenes
         model.eval()

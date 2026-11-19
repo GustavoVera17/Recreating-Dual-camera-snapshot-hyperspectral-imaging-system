@@ -249,11 +249,13 @@ class CAVEDualDataset(Dataset):
         bands = []
         for file_p in band_files:
             img = Image.open(file_p)
-            arr = np.array(img, dtype=np.float32)
+            raw_arr = np.array(img)
+            is_uint16 = (raw_arr.dtype == np.uint16)
+            arr = raw_arr.astype(np.float32)
             if arr.ndim == 3:
                 arr = arr[:, :, 0]
 
-            max_val = 65535.0 if (arr.dtype == np.uint16 or np.max(arr) > 255.0) else 255.0
+            max_val = 65535.0 if (is_uint16 or np.max(arr) > 255.0) else 255.0
             norm_arr = np.clip(arr / max_val, 0.0, 1.0)
             bands.append(norm_arr)
 

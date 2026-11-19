@@ -45,9 +45,13 @@ Write-Host "[*] Launching training for $Epochs epochs (Batch Size: $BatchSize, L
 $trainArgs = @(
     "train.py",
     "--epochs", $Epochs,
-    "--batch_size", $BatchSize,
+    "--batch-size", $BatchSize,
+    "--micro-batch-size", "4",
+    "--num-patches-per-scene", "30",
     "--lr", $Lr,
-    "--dash_interval", $DashInterval
+    "--beta-spec", "0.0",
+    "--beta-tv", "0.0",
+    "--dash-interval", $DashInterval
 )
 if ($GitSync) {
     $trainArgs += "--git-sync"

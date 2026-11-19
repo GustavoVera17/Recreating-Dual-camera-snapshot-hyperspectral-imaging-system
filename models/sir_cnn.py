@@ -180,8 +180,6 @@ class SpectralImageReconstructionCNN(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(total_channels, self.num_bands, kernel_size=3, padding=1, bias=True)
         )
-        # Learnable residual scaling preserving Stage 1 radiometric anchor across BatchNorm
-        self.res_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
     @property
     def use_checkpoint(self) -> bool:
@@ -223,9 +221,8 @@ class SpectralImageReconstructionCNN(nn.Module):
         # Multiscale aggregation: upsample all streams to H x W and concatenate
         fused = self.backbone.aggregate(streams)
 
-        # Reconstruction head projection + Stage 1 radiometric residual anchor
-        raw_head = self.head(fused)
-        raw_pred = x_stage1 + self.res_scale * raw_head
+        # Reconstruction head projection (strict sequential Fig. 6 architecture)
+        raw_pred = self.head(fused)
 
         # Physical spectral bounding in [0.0, 1.0] with tangent-cone recovery gradients
         out = _PhysicalSpectralClampSTE.apply(raw_pred)

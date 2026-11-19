@@ -61,6 +61,28 @@ def calc_psnr(
     return float(min(psnr, 100.0))
 
 
+def calc_psnr_per_band(
+    pred: Union[torch.Tensor, np.ndarray],
+    gt: Union[torch.Tensor, np.ndarray],
+    max_val: float = 1.0
+) -> float:
+    """
+    Computes mean 2D spatial PSNR across all spectral bands (standard HSI benchmark convention).
+    """
+    p = pred.detach().float() if isinstance(pred, torch.Tensor) else torch.from_numpy(np.asarray(pred, dtype=np.float32))
+    g = gt.detach().float() if isinstance(gt, torch.Tensor) else torch.from_numpy(np.asarray(gt, dtype=np.float32))
+    if p.ndim == 3:
+        p, g = p.unsqueeze(0), g.unsqueeze(0)
+    mse_per_band = torch.mean((p - g) ** 2, dim=(-2, -1))  # [B, C]
+    max_sq = float(max_val) ** 2
+    band_psnrs = torch.where(
+        mse_per_band <= 1e-12,
+        torch.full_like(mse_per_band, 100.0),
+        torch.clamp(10.0 * torch.log10(max_sq / torch.clamp(mse_per_band, min=1e-12)), max=100.0),
+    )
+    return float(torch.mean(band_psnrs).item())
+
+
 def calc_ssim(
     pred: Union[torch.Tensor, np.ndarray],
     gt: Union[torch.Tensor, np.ndarray],
@@ -216,10 +238,12 @@ def evaluate_cube(
         Dictionary with keys 'psnr' (dB), 'ssim', 'sam_rad' (radians), and 'sam' (radians).
     """
     psnr = calc_psnr(pred, gt, max_val=max_val)
+    psnr_band = calc_psnr_per_band(pred, gt, max_val=max_val)
     ssim = calc_ssim(pred, gt, max_val=max_val)
     sam_rad = calc_sam(pred, gt)
     return {
         'psnr': psnr,
+        'psnr_band': psnr_band,
         'ssim': ssim,
         'sam_rad': sam_rad,
         'sam_deg': float(sam_rad * 180.0 / np.pi),
