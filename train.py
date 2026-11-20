@@ -240,8 +240,28 @@ def parse_args():
         action='store_true',
         help="Overwrite existing CSV log file instead of appending"
     )
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        help="Path to checkpoint or state_dict (.pth) file to resume training from"
+    )
+    parser.add_argument(
+        '--resume-epoch', '--resume_epoch',
+        type=int,
+        default=0,
+        dest='resume_epoch',
+        help="Completed epoch count when resuming from a raw state_dict without 'epoch'"
+    )
 
     return parser.parse_args()
+
+
+def _atomic_torch_save(obj: Any, path: str) -> None:
+    """Writes checkpoint to a temporary file then atomically replaces destination."""
+    tmp_path = f"{path}.tmp"
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def _set_global_seed(seed: int) -> None:
@@ -614,11 +634,58 @@ def main():
         eps=1e-8,
         weight_decay=0.0,
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=args.decay_step,
-        gamma=args.decay_gamma,
-    )
+
+    start_epoch = 1
+    best_psnr = -1.0
+    if args.resume is not None:
+        resume_path = os.path.abspath(args.resume)
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            sd = {k: v.float() if (torch.is_tensor(v) and v.dtype == torch.float16) else v for k, v in ckpt['model_state_dict'].items()}
+            model.load_state_dict(sd, strict=True)
+            if 'optimizer_state_dict' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            resumed_epoch = int(ckpt.get('epoch', args.resume_epoch))
+            best_psnr = float(ckpt.get('best_psnr', ckpt.get('val_psnr', -1.0)))
+        else:
+            sd = {k: v.float() if (torch.is_tensor(v) and v.dtype == torch.float16) else v for k, v in ckpt.items()}
+            incompat = model.load_state_dict(sd, strict=False)
+            alias_prefixes = ('stage1_ascension.', 'dimensional_ascension.', 'stage2.')
+            non_alias_missing = [k for k in incompat.missing_keys if not k.startswith(alias_prefixes)]
+            if non_alias_missing or incompat.unexpected_keys:
+                raise RuntimeError(
+                    f"Incompatible resume checkpoint {resume_path}: missing={non_alias_missing}, unexpected={incompat.unexpected_keys}"
+                )
+            resumed_epoch = int(args.resume_epoch)
+
+        hist_psnr = logger.history.get('val_psnr', [])
+        if hist_psnr:
+            best_psnr = max(best_psnr, float(max(hist_psnr)))
+        start_epoch = resumed_epoch + 1
+
+        completed_decays = resumed_epoch // args.decay_step
+        resumed_lr = args.lr * (args.decay_gamma ** completed_decays)
+        for pg in optimizer.param_groups:
+            pg['initial_lr'] = args.lr
+            pg['lr'] = resumed_lr
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.decay_step,
+            gamma=args.decay_gamma,
+            last_epoch=resumed_epoch,
+        )
+        print(
+            f"[*] Resumed from {args.resume} at completed epoch {resumed_epoch} -> "
+            f"starting epoch {start_epoch}/{args.epochs} | LR={resumed_lr:.6f} | best_psnr={best_psnr:.2f} dB"
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.decay_step,
+            gamma=args.decay_gamma,
+        )
 
     amp_dtype, scaler = _resolve_amp_config(device)
     amp_label = str(amp_dtype).replace('torch.', '') if amp_dtype is not None else 'float32'
@@ -657,12 +724,11 @@ def main():
         worker_init_fn=worker_init_fn,
     )
 
-    best_psnr = -1.0
-    print(f"\n[*] Commencing full training cycle ({args.epochs} epochs, {len(train_dataset)} samples/ep)...")
+    print(f"\n[*] Commencing full training cycle ({start_epoch}..{args.epochs} epochs, {len(train_dataset)} samples/ep)...")
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t_epoch_start = time.time()
-        if device.type == 'cuda' and epoch == 1:
+        if device.type == 'cuda' and epoch == start_epoch:
             torch.cuda.reset_peak_memory_stats()
         model.train()
         total_loss = 0.0
@@ -704,9 +770,9 @@ def main():
         scheduler.step()
         avg_train_loss = total_loss / max(1, num_opt_steps)
         current_lr = float(optimizer.param_groups[0]['lr'])
-        if device.type == 'cuda' and epoch == 1:
+        if device.type == 'cuda' and epoch == start_epoch:
             peak_mib = torch.cuda.max_memory_allocated() / (1024.0 ** 2)
-            print(f"[*] Epoch 1 Peak CUDA VRAM allocated: {peak_mib:.1f} MiB ({num_opt_steps} optimizer steps/epoch)")
+            print(f"[*] Epoch {epoch} Peak CUDA VRAM allocated: {peak_mib:.1f} MiB ({num_opt_steps} optimizer steps/epoch)")
 
         # Validation evaluation across all validation scenes
         model.eval()
@@ -761,14 +827,15 @@ def main():
             f"LR: {current_lr:.6f} | Time: {epoch_dur:.2f}s | ETA: {eta_str}"
         )
 
-        # Checkpointing
+        # Checkpointing (atomic write + rename prevents corruption on sudden power loss)
         latest_ckpt_path = os.path.join(checkpoints_dir, "latest_checkpoint.pth")
-        torch.save(
+        _atomic_torch_save(
             {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_psnr': val_psnr,
+                'best_psnr': max(best_psnr, val_psnr),
                 'val_ssim': val_ssim,
                 'val_sam': val_sam,
             },
@@ -778,12 +845,12 @@ def main():
         if val_psnr > best_psnr:
             best_psnr = val_psnr
             best_ckpt_path = os.path.join(checkpoints_dir, "best_model.pth")
-            torch.save(model.state_dict(), best_ckpt_path)
+            _atomic_torch_save(model.state_dict(), best_ckpt_path)
             # Save deduplicated FP16 copy (~60MB < 100MB GitHub limit)
             try:
                 fp16_state = _dedup_fp16_state_dict(model)
-                torch.save(fp16_state, os.path.join(checkpoints_dir, "best_model_fp16.pth"))
-                torch.save(fp16_state, os.path.join(weights_sync_dir, "best_model_fp16.pth"))
+                _atomic_torch_save(fp16_state, os.path.join(checkpoints_dir, "best_model_fp16.pth"))
+                _atomic_torch_save(fp16_state, os.path.join(weights_sync_dir, "best_model_fp16.pth"))
             except Exception as e:
                 print(f"  [!] FP16 checkpoint save notice: {e}")
             print(f"  [+] New Best PSNR: {best_psnr:.2f} dB (saved {best_ckpt_path})")
